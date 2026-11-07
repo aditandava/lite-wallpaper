@@ -1,0 +1,31 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Compile
+        shell: cmd
+        run: cl /nologo /O2 /MT /EHsc /GL /DUNICODE /D_UNICODE litewall.cpp /Fe:litewall.exe /link /SUBSYSTEM:WINDOWS /LTCG
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: litewall
+          path: litewall.exe
+
+      - name: Attach to release (only when you push a tag like v1)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: litewall.exe
