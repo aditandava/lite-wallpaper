@@ -65,9 +65,10 @@ static const UINT WM_APP_FAIL  = WM_APP + 1;   // active video cannot be played
 static const UINT WM_APP_ENDED = WM_APP + 2;   // active video reached its end
 static const UINT WM_APP_DROP  = WM_APP + 3;   // standby video failed to load
 
-static const UINT_PTR T_PAUSE = 1;             // 2 s: pause when a game is in front
-static const UINT_PTR T_LOOP  = 2;             // 250 ms: watch for the end of the video
-static const UINT_PTR T_START = 3;             // one-shot: start the standby just before the end
+static const UINT_PTR T_PAUSE   = 1;           // 2 s: pause when a game is in front
+static const UINT_PTR T_LOOP    = 2;           // 250 ms: watch for the end of the video
+static const UINT_PTR T_START   = 3;           // one-shot: start the standby just before the end
+static const UINT_PTR T_CLEANUP = 4;           // one-shot: clean up the old player
 
 static const LONGLONG kPrepareMs   = 4000;     // prepare the standby this long before the end
 static const int      kDefaultLead = 60;       // ms the standby starts before the end
@@ -89,6 +90,7 @@ static HWND         g_layer          = nullptr;
 static HMONITOR     g_monitor        = nullptr;
 static Slot*        g_active         = nullptr;
 static Slot*        g_standby        = nullptr;
+static Slot*        g_garbage        = nullptr; // holds the old player to defer destruction
 static int          g_nextId         = 0;
 static int          g_leadMs         = kDefaultLead;
 static bool         g_paused         = false;
@@ -180,6 +182,7 @@ static void PlaceWindow(HWND hwnd) {
 static Slot* FindSlot(int id) {
     if (g_active  && g_active->id  == id) return g_active;
     if (g_standby && g_standby->id == id) return g_standby;
+    if (g_garbage && g_garbage->id == id) return g_garbage;
     return nullptr;                      // slot was already retired: ignore late events
 }
 
@@ -395,7 +398,12 @@ static void OnEnded() {
         KillTimer(g_ctrl, T_START);
         g_startScheduled = false;
         DropPeriod();
-        DestroySlot(a);                    // hidden behind b by now
+        
+        // Defer destruction of the old player to prevent stutter on the main thread
+        if (g_garbage) DestroySlot(g_garbage); 
+        g_garbage = a;
+        ShowWindow(a->hwnd, SW_HIDE);
+        SetTimer(g_ctrl, T_CLEANUP, 1000, nullptr);
         return;
     }
 
@@ -504,6 +512,12 @@ static LRESULT CALLBACK CtrlProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             KillTimer(hwnd, T_START);
             g_startScheduled = false;
             StartStandby();
+        } else if (wp == T_CLEANUP) {
+            KillTimer(hwnd, T_CLEANUP);
+            if (g_garbage) {
+                DestroySlot(g_garbage);
+                g_garbage = nullptr;
+            }
         }
         return 0;
     case WM_APP_ENDED:
@@ -531,10 +545,15 @@ static LRESULT CALLBACK CtrlProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         KillTimer(hwnd, T_PAUSE);
         KillTimer(hwnd, T_LOOP);
         KillTimer(hwnd, T_START);
+        KillTimer(hwnd, T_CLEANUP);
         DestroySlot(g_standby);
         g_standby = nullptr;
         DestroySlot(g_active);
         g_active = nullptr;
+        if (g_garbage) {
+            DestroySlot(g_garbage);
+            g_garbage = nullptr;
+        }
         DropPeriod();
         PostQuitMessage(0);                // also runs if Explorer restarts and kills our parent
         return 0;
@@ -565,7 +584,7 @@ static bool RegValueExists(const wchar_t* subkey, const wchar_t* name) {
     return r == ERROR_SUCCESS;
 }
 
-static void RegDeleteValue(const wchar_t* subkey, const wchar_t* name) {
+static void DeleteRegValue(const wchar_t* subkey, const wchar_t* name) {
     HKEY key;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, subkey, 0, KEY_SET_VALUE, &key) == ERROR_SUCCESS) {
         RegDeleteValueW(key, name);
@@ -596,8 +615,8 @@ static void MarkConfigured() {
 }
 
 static void RemoveAutostart() {
-    RegDeleteValue(kRunKey, kRunName);
-    RegDeleteValue(kApprovedKey, kRunName);
+    DeleteRegValue(kRunKey, kRunName);
+    DeleteRegValue(kApprovedKey, kRunName);
     MarkConfigured();                      // do not re-add it automatically next time
 }
 
