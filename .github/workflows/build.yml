@@ -1,8 +1,10 @@
-name: build
+name: Build LiteWall
+
+run-name: Build LiteWall (${{ github.event_name == 'workflow_dispatch' && 'manual run' || 'auto run' }})
 
 on:
   push:
-  workflow_dispatch:
+  workflow_dispatch:   # adds the "Run workflow" button in the Actions tab
 
 permissions:
   contents: write
