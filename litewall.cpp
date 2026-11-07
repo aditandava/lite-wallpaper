@@ -1,14 +1,5 @@
-// LiteWall (mpv edition) - tiny MP4 live wallpaper for Windows 10/11.
-//
-// * Uses libmpv for flawless, zero-hitch, gapless hardware-accelerated loops.
-// * Pauses itself (0% CPU/GPU) while a game / fullscreen app is in front.
-// * Can register itself to start with Windows (HKCU Run key, no admin).
-//
-// Usage:
-//   litewall.exe "C:\Videos\wall.mp4"
-//   litewall.exe --autostart "C:\Videos\wall.mp4"
-//   litewall.exe --remove-autostart
-//   litewall.exe --stop
+// LiteWall - tiny MP4 live wallpaper for Windows 10/11.
+// Uses Media Foundation (MFPlay) - No external DLLs required.
 
 #ifndef WINVER
 #define WINVER 0x0A00
@@ -24,44 +15,89 @@
 #endif
 
 #include <windows.h>
+#include <mmsystem.h>
 #include <shellapi.h>
-#include <string>
+#include <objbase.h>
+#include <propidl.h>
+#include <mfapi.h>
+#include <mfidl.h>
+#include <mfplay.h>
 #include <cstdlib>
-#include <mpv/client.h>
+#include <cwchar>
+#include <string>
 
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "advapi32.lib")
-#pragma comment(lib, "mpv.lib")
+#pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "mfplay.lib")
+#pragma comment(lib, "mfuuid.lib")
 
-static const wchar_t kVideoClass[]  = L"LiteWallVideo";
-static const wchar_t kRunKey[]      = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
-static const wchar_t kRunName[]     = L"LiteWall";
+static const wchar_t kClass[]      = L"LiteWallWindow";   
+static const wchar_t kVideoClass[] = L"LiteWallVideo";    
+static const wchar_t kRunKey[]     = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t kRunName[]    = L"LiteWall";
 static const wchar_t kApprovedKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
-static const wchar_t kAppKey[]      = L"Software\\LiteWall";
+static const wchar_t kAppKey[]     = L"Software\\LiteWall";   
 
-static const UINT_PTR T_PAUSE = 1;
+static const UINT WM_APP_FAIL  = WM_APP + 1;   
+static const UINT WM_APP_ENDED = WM_APP + 2;   
+static const UINT WM_APP_DROP  = WM_APP + 3;   
 
-static HINSTANCE    g_inst    = nullptr;
-static HWND         g_layer   = nullptr;
-static HWND         g_hwnd    = nullptr;
-static HMONITOR     g_monitor = nullptr;
-static mpv_handle*  g_mpv     = nullptr;
-static bool         g_paused  = false;
+static const UINT_PTR T_PAUSE   = 1;           
+static const UINT_PTR T_LOOP    = 2;           
+static const UINT_PTR T_CLEANUP = 4;           
+
+static const LONGLONG kPrepareMs   = 4000;     
+static const int      kDefaultLead = 80; // Optimized lead time
+
+struct Slot {
+    int              id       = 0;
+    IMFPMediaPlayer* player   = nullptr;
+    HWND             hwnd     = nullptr;
+    LONGLONG         duration = 0;      
+    int              stage    = 0;      
+    bool             cued     = false;  
+    bool             started  = false;  
+};
+
+static HINSTANCE    g_inst           = nullptr;
+static HWND         g_ctrl           = nullptr;
+static HWND         g_layer          = nullptr;
+static HMONITOR     g_monitor        = nullptr;
+static Slot*        g_active         = nullptr;
+static Slot*        g_standby        = nullptr;
+static Slot*        g_garbage        = nullptr; 
+static int          g_nextId         = 0;
+static int          g_leadMs         = kDefaultLead;
+static bool         g_paused         = false;
+static bool         g_alwaysPlay     = false;
+static bool         g_sound          = false;
+static bool         g_stretch        = false;
+static bool         g_noStandby      = false;   
+static bool         g_periodRaised   = false;
 static std::wstring g_video;
+static std::wstring g_failText;
 
 struct Options {
     std::wstring video;
-    bool autostart = false;
-    bool removeAutostart = false;
-    bool stop = false;
+    bool sound = false, stretch = false, alwaysPlay = false;
+    bool autostart = false, removeAutostart = false, stop = false;
+    int  lead = kDefaultLead;
 };
-
-// ---------------------------------------------------------------- helpers
 
 static void ShowError(const std::wstring& text) {
     MessageBoxW(nullptr, text.c_str(), L"LiteWall", MB_OK | MB_ICONERROR);
 }
+
+static LONGLONG VariantToLL(const PROPVARIANT& v) {
+    return (v.vt == VT_I8 || v.vt == VT_UI8) ? static_cast<LONGLONG>(v.hVal.QuadPart) : 0;
+}
+
+static void RaisePeriod() { if (!g_periodRaised) { timeBeginPeriod(1); g_periodRaised = true; } }
+static void DropPeriod()  { if (g_periodRaised)  { timeEndPeriod(1);   g_periodRaised = false; } }
 
 static BOOL CALLBACK EnumProc(HWND top, LPARAM lp) {
     if (FindWindowExW(top, nullptr, L"SHELLDLL_DefView", nullptr)) {
@@ -95,7 +131,7 @@ static HWND GetDesktopLayer() {
 }
 
 static bool StopRunningInstance(HWND layer) {
-    HWND old = FindWindowExW(layer, nullptr, kVideoClass, nullptr);
+    HWND old = FindWindowExW(layer, nullptr, kClass, nullptr);
     if (!old) return false;
     PostMessageW(old, WM_CLOSE, 0, 0);
     for (int i = 0; i < 30 && IsWindow(old); ++i) Sleep(100);
@@ -114,23 +150,102 @@ static void PlaceWindow(HWND hwnd) {
                mi.rcMonitor.bottom - mi.rcMonitor.top, TRUE);
 }
 
-static std::wstring FullPath(const std::wstring& p) {
-    DWORD n = GetFullPathNameW(p.c_str(), 0, nullptr, nullptr);
-    if (!n) return p;
-    std::wstring out(n, L'\0');
-    n = GetFullPathNameW(p.c_str(), n, &out[0], nullptr);
-    out.resize(n);
-    return out;
+static Slot* FindSlot(int id) {
+    if (g_active  && g_active->id  == id) return g_active;
+    if (g_standby && g_standby->id == id) return g_standby;
+    if (g_garbage && g_garbage->id == id) return g_garbage;
+    return nullptr;                      
 }
 
-// ----------------------------------------------------------- pause logic
+static void HandlePlayerEvent(int id, MFP_EVENT_HEADER* h);
+
+class PlayerCallback : public IMFPMediaPlayerCallback {
+public:
+    explicit PlayerCallback(int id) : m_id(id) {}
+
+    STDMETHODIMP QueryInterface(REFIID riid, void** ppv) override {
+        if (!ppv) return E_POINTER;
+        if (riid == __uuidof(IUnknown) || riid == __uuidof(IMFPMediaPlayerCallback)) {
+            *ppv = static_cast<IMFPMediaPlayerCallback*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
+    }
+    STDMETHODIMP_(ULONG) AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&m_ref)); }
+    STDMETHODIMP_(ULONG) Release() override {
+        ULONG r = static_cast<ULONG>(InterlockedDecrement(&m_ref));
+        if (r == 0) delete this;
+        return r;
+    }
+    void STDMETHODCALLTYPE OnMediaPlayerEvent(MFP_EVENT_HEADER* h) override { HandlePlayerEvent(m_id, h); }
+
+private:
+    volatile LONG m_ref = 1;
+    int           m_id;
+};
+
+static void DestroySlot(Slot* s) {
+    if (!s) return;
+    if (s->hwnd) SetWindowLongPtrW(s->hwnd, GWLP_USERDATA, 0);
+    if (s->player) {
+        s->player->Shutdown();
+        s->player->Release();
+        s->player = nullptr;
+    }
+    if (s->hwnd) { DestroyWindow(s->hwnd); s->hwnd = nullptr; }
+    delete s;
+}
+
+static Slot* MakeSlot(bool startPlayback, HWND below, Slot** dest) {
+    Slot* s = new Slot();
+    s->id = ++g_nextId;
+    *dest = s;
+
+    s->hwnd = CreateWindowExW(0, kVideoClass, L"", WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS,
+                              0, 0, 100, 100, g_layer, nullptr, g_inst, nullptr);
+    if (!s->hwnd) { *dest = nullptr; delete s; return nullptr; }
+    SetWindowLongPtrW(s->hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(s));
+    PlaceWindow(s->hwnd);
+    if (below) SetWindowPos(s->hwnd, below, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+
+    PlayerCallback* cb = new PlayerCallback(s->id);
+    HRESULT hr = MFPCreateMediaPlayer(g_video.c_str(), startPlayback ? TRUE : FALSE,
+                                      MFP_OPTION_NONE, cb, s->hwnd, &s->player);
+    cb->Release();                       
+    if (FAILED(hr) || !s->player) { *dest = nullptr; DestroySlot(s); return nullptr; }
+
+    s->player->SetMute((startPlayback && g_sound) ? FALSE : TRUE);
+    s->player->SetAspectRatioMode(g_stretch ? 0 : 1);
+    return s;
+}
+
+static void CreateStandby() {
+    if (g_standby || g_noStandby || !g_active) return;
+    RaisePeriod();                       
+    if (!MakeSlot(false, g_active->hwnd, &g_standby)) {
+        g_noStandby = true;
+        DropPeriod();
+    }
+}
+
+static void CancelStandbyStart() {
+    if (g_standby && g_standby->started && g_standby->player) {
+        g_standby->player->Pause();
+        PROPVARIANT z = {}; z.vt = VT_I8; z.hVal.QuadPart = 0;
+        g_standby->player->SetPosition(MFP_POSITIONTYPE_100NS, &z);
+        g_standby->started = false;
+    }
+}
 
 static bool ShouldPause() {
+    if (g_alwaysPlay) return false;
+
     QUERY_USER_NOTIFICATION_STATE state;
     if (SUCCEEDED(SHQueryUserNotificationState(&state)) &&
-        (state == QUNS_BUSY || state == QUNS_RUNNING_D3D_FULL_SCREEN ||
-         state == QUNS_PRESENTATION_MODE)) {
-        return true;
+        (state == QUNS_BUSY || state == QUNS_RUNNING_D3D_FULL_SCREEN || state == QUNS_PRESENTATION_MODE)) {
+        return true;                       
     }
 
     HWND fg = GetForegroundWindow();
@@ -139,55 +254,191 @@ static bool ShouldPause() {
     wchar_t cls[64] = {};
     GetClassNameW(fg, cls, 64);
     if (!wcscmp(cls, L"Progman") || !wcscmp(cls, L"WorkerW") ||
-        !wcscmp(cls, L"Shell_TrayWnd") || !wcscmp(cls, kVideoClass)) {
-        return false;
+        !wcscmp(cls, L"Shell_TrayWnd") || !wcscmp(cls, kClass) || !wcscmp(cls, kVideoClass)) {
+        return false;                      
     }
     if (!IsWindowVisible(fg) || IsIconic(fg) || !IsZoomed(fg)) return false;
     return MonitorFromWindow(fg, MONITOR_DEFAULTTONULL) == g_monitor;
 }
 
 static void UpdatePauseState() {
-    if (!g_mpv) return;
+    if (!g_active || !g_active->player) return;
     bool want = ShouldPause();
     if (want == g_paused) return;
-    mpv_set_property_string(g_mpv, "pause", want ? "yes" : "no");
-    g_paused = want;
+    HRESULT hr = want ? g_active->player->Pause() : g_active->player->Play();
+    if (SUCCEEDED(hr)) {
+        g_paused = want;
+        if (want) CancelStandbyStart();
+    }
 }
 
-// ----------------------------------------------------------- window proc
+static void StartStandby() {
+    if (g_standby && g_standby->cued && !g_standby->started && !g_paused) {
+        if (SUCCEEDED(g_standby->player->Play())) g_standby->started = true;
+    }
+}
+
+static void LoopTick() {
+    Slot* a = g_active;
+    if (!a || !a->player || g_paused) return;
+
+    if (a->duration <= 0) {
+        PROPVARIANT d = {};
+        if (SUCCEEDED(a->player->GetDuration(MFP_POSITIONTYPE_100NS, &d))) a->duration = VariantToLL(d);
+    }
+    if (a->duration <= 0) return;
+
+    PROPVARIANT p = {};
+    if (FAILED(a->player->GetPosition(MFP_POSITIONTYPE_100NS, &p))) return;
+    LONGLONG remainMs = (a->duration - VariantToLL(p)) / 10000;
+    if (remainMs < 0) remainMs = 0;
+
+    if (!g_standby) {
+        if (remainMs < kPrepareMs) CreateStandby();
+        return;
+    }
+    
+    if (g_standby->cued && !g_standby->started) {
+        if (remainMs <= g_leadMs) StartStandby();
+    }
+}
+
+static void OnEnded() {
+    Slot* a = g_active;
+    Slot* b = g_standby;
+    if (!a) return;
+
+    if (b && b->cued && b->player) {
+        if (!b->started) { b->player->Play(); b->started = true; }
+        if (g_sound) b->player->SetMute(FALSE);
+        SetWindowPos(b->hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        g_active  = b;
+        g_standby = nullptr;
+        DropPeriod();
+        
+        // Defer destruction to avoid main thread stutter
+        if (g_garbage) DestroySlot(g_garbage); 
+        g_garbage = a;
+        ShowWindow(a->hwnd, SW_HIDE);
+        SetTimer(g_ctrl, T_CLEANUP, 1000, nullptr);
+        return;
+    }
+
+    PROPVARIANT zero = {}; zero.vt = VT_I8; zero.hVal.QuadPart = 0;
+    a->player->SetPosition(MFP_POSITIONTYPE_100NS, &zero);
+    a->player->Play();
+}
+
+static void HandlePlayerEvent(int id, MFP_EVENT_HEADER* h) {
+    if (!h) return;
+    Slot* s = FindSlot(id);
+    if (!s || !s->player) return;
+    const bool standby = (s == g_standby);
+
+    if (FAILED(h->hrEvent)) {
+        const MFP_EVENT_TYPE t = h->eEventType;
+        if (t == MFP_EVENT_TYPE_MEDIAITEM_CREATED || t == MFP_EVENT_TYPE_MEDIAITEM_SET || t == MFP_EVENT_TYPE_ERROR) {
+            if (standby) PostMessageW(g_ctrl, WM_APP_DROP, 0, 0);
+            else {
+                g_failText = L"This video could not be played.";
+                PostMessageW(g_ctrl, WM_APP_FAIL, 0, 0);
+            }
+        }
+        return;
+    }
+
+    switch (h->eEventType) {
+    case MFP_EVENT_TYPE_MEDIAITEM_SET: {
+        PROPVARIANT d = {};
+        if (SUCCEEDED(s->player->GetDuration(MFP_POSITIONTYPE_100NS, &d))) s->duration = VariantToLL(d);
+        if (standby) { s->stage = 1; s->player->Play(); }
+        break;
+    }
+    case MFP_EVENT_TYPE_PLAY:
+        if (standby && s->stage == 1) { s->stage = 2; s->player->Pause(); }
+        break;
+    case MFP_EVENT_TYPE_PAUSE:
+        if (standby && s->stage == 2) {
+            s->stage = 3;
+            PROPVARIANT z = {}; z.vt = VT_I8; z.hVal.QuadPart = 0;
+            s->player->SetPosition(MFP_POSITIONTYPE_100NS, &z);
+        }
+        break;
+    case MFP_EVENT_TYPE_POSITION_SET:
+        if (standby && s->stage == 3) {
+            s->stage = 4;
+            s->cued = true;
+            // Force the player to paint the frame while hidden
+            s->player->UpdateVideo();
+        }
+        break;
+    case MFP_EVENT_TYPE_PLAYBACK_ENDED:
+        if (s == g_active) PostMessageW(g_ctrl, WM_APP_ENDED, 0, 0);
+        break;
+    }
+}
 
 static LRESULT CALLBACK VideoProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    Slot* s = reinterpret_cast<Slot*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
     switch (msg) {
-    case WM_TIMER:
-        if (wp == T_PAUSE) UpdatePauseState();
+    case WM_ERASEBKGND: return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        if (s && s->player) s->player->UpdateVideo();
+        else FillRect(dc, &ps.rcPaint, static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH)));
+        EndPaint(hwnd, &ps);
         return 0;
-    case WM_ERASEBKGND:
-        return 1;
-    case WM_DISPLAYCHANGE:
-        g_monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
-        PlaceWindow(hwnd);
-        return 0;
-    case WM_DESTROY:
-        KillTimer(hwnd, T_PAUSE);
-        if (g_mpv) {
-            mpv_terminate_destroy(g_mpv);
-            g_mpv = nullptr;
-        }
-        PostQuitMessage(0);
+    }
+    case WM_SIZE:
+        if (s && s->player) s->player->UpdateVideo();
         return 0;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
-// ------------------------------------------------------------- autostart
+static LRESULT CALLBACK CtrlProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_TIMER:
+        if (wp == T_PAUSE) UpdatePauseState();
+        else if (wp == T_LOOP) LoopTick();
+        else if (wp == T_CLEANUP) {
+            KillTimer(hwnd, T_CLEANUP);
+            if (g_garbage) { DestroySlot(g_garbage); g_garbage = nullptr; }
+        }
+        return 0;
+    case WM_APP_ENDED:
+        OnEnded();
+        return 0;
+    case WM_APP_DROP:
+        CancelStandbyStart();
+        if (g_standby) { DestroySlot(g_standby); g_standby = nullptr; }
+        g_noStandby = true;                
+        DropPeriod();
+        return 0;
+    case WM_APP_FAIL:
+        ShowError(g_failText); DestroyWindow(hwnd); return 0;
+    case WM_DISPLAYCHANGE:
+        g_monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
+        if (g_active  && g_active->hwnd)  PlaceWindow(g_active->hwnd);
+        if (g_standby && g_standby->hwnd) PlaceWindow(g_standby->hwnd);
+        return 0;
+    case WM_DESTROY:
+        KillTimer(hwnd, T_PAUSE); KillTimer(hwnd, T_LOOP); KillTimer(hwnd, T_CLEANUP);
+        DestroySlot(g_standby); g_standby = nullptr;
+        DestroySlot(g_active); g_active = nullptr;
+        if (g_garbage) { DestroySlot(g_garbage); g_garbage = nullptr; }
+        DropPeriod();
+        PostQuitMessage(0);                
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
 
 static bool SetAutostart(const std::wstring& command) {
     HKEY key;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0, KEY_SET_VALUE,
-                        nullptr, &key, nullptr) != ERROR_SUCCESS) return false;
-    LONG r = RegSetValueExW(key, kRunName, 0, REG_SZ,
-                            reinterpret_cast<const BYTE*>(command.c_str()),
-                            static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kRunKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) return false;
+    LONG r = RegSetValueExW(key, kRunName, 0, REG_SZ, reinterpret_cast<const BYTE*>(command.c_str()), static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t)));
     RegCloseKey(key);
     return r == ERROR_SUCCESS;
 }
@@ -203,15 +454,13 @@ static bool RegValueExists(const wchar_t* subkey, const wchar_t* name) {
 static void DeleteRegValue(const wchar_t* subkey, const wchar_t* name) {
     HKEY key;
     if (RegOpenKeyExW(HKEY_CURRENT_USER, subkey, 0, KEY_SET_VALUE, &key) == ERROR_SUCCESS) {
-        RegDeleteValueW(key, name);
-        RegCloseKey(key);
+        RegDeleteValueW(key, name); RegCloseKey(key);
     }
 }
 
 static void MarkEnabledInTaskManager() {
     HKEY key;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, kApprovedKey, 0, nullptr, 0, KEY_SET_VALUE,
-                        nullptr, &key, nullptr) != ERROR_SUCCESS) return;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kApprovedKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) return;
     BYTE data[12] = { 0x02 };
     RegSetValueExW(key, kRunName, 0, REG_BINARY, data, sizeof(data));
     RegCloseKey(key);
@@ -219,8 +468,7 @@ static void MarkEnabledInTaskManager() {
 
 static void MarkConfigured() {
     HKEY key;
-    if (RegCreateKeyExW(HKEY_CURRENT_USER, kAppKey, 0, nullptr, 0, KEY_SET_VALUE,
-                        nullptr, &key, nullptr) != ERROR_SUCCESS) return;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, kAppKey, 0, nullptr, 0, KEY_SET_VALUE, nullptr, &key, nullptr) != ERROR_SUCCESS) return;
     DWORD one = 1;
     RegSetValueExW(key, L"Configured", 0, REG_DWORD, reinterpret_cast<const BYTE*>(&one), sizeof(one));
     RegCloseKey(key);
@@ -229,7 +477,16 @@ static void MarkConfigured() {
 static void RemoveAutostart() {
     DeleteRegValue(kRunKey, kRunName);
     DeleteRegValue(kApprovedKey, kRunName);
-    MarkConfigured();
+    MarkConfigured();                      
+}
+
+static std::wstring FullPath(const std::wstring& p) {
+    DWORD n = GetFullPathNameW(p.c_str(), 0, nullptr, nullptr);
+    if (!n) return p;
+    std::wstring out(n, L'\0');
+    n = GetFullPathNameW(p.c_str(), n, &out[0], nullptr);
+    out.resize(n);
+    return out;
 }
 
 static bool ParseArgs(Options& o) {
@@ -238,16 +495,22 @@ static bool ParseArgs(Options& o) {
     if (!argv) return false;
     for (int i = 1; i < argc; ++i) {
         std::wstring a = argv[i];
-        if      (a == L"--autostart")        o.autostart = true;
+        if      (a == L"--sound")            o.sound = true;
+        else if (a == L"--stretch")          o.stretch = true;
+        else if (a == L"--always-play")      o.alwaysPlay = true;
+        else if (a == L"--autostart")        o.autostart = true;
         else if (a == L"--remove-autostart") o.removeAutostart = true;
         else if (a == L"--stop")             o.stop = true;
+        else if (a == L"--lead" && i + 1 < argc) {
+            o.lead = _wtoi(argv[++i]);
+            if (o.lead < 0) o.lead = 0;
+            if (o.lead > 500) o.lead = 500;
+        }
         else if (a.rfind(L"--", 0) != 0)     o.video = a;
     }
     LocalFree(argv);
     return true;
 }
-
-// ------------------------------------------------------------------ main
 
 int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -256,6 +519,10 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
 
     Options opt;
     if (!ParseArgs(opt)) return 1;
+    g_alwaysPlay = opt.alwaysPlay;
+    g_sound      = opt.sound;
+    g_stretch    = opt.stretch;
+    g_leadMs     = opt.lead;
 
     if (opt.removeAutostart || opt.stop) {
         if (opt.removeAutostart) RemoveAutostart();
@@ -265,81 +532,65 @@ int WINAPI wWinMain(HINSTANCE inst, HINSTANCE, PWSTR, int) {
     }
 
     if (opt.video.empty()) {
-        ShowError(L"Usage:\nlitewall.exe \"C:\\path\\video.mp4\"\nlitewall.exe --autostart \"C:\\path\\video.mp4\"\nlitewall.exe --remove-autostart\nlitewall.exe --stop");
+        ShowError(L"Usage: litewall.exe \"C:\\path\\video.mp4\"");
         return 1;
     }
 
     g_video = FullPath(opt.video);
-    if (GetFileAttributesW(g_video.c_str()) == INVALID_FILE_ATTRIBUTES) {
-        ShowError(L"File not found:\n" + g_video);
-        return 1;
-    }
+    if (GetFileAttributesW(g_video.c_str()) == INVALID_FILE_ATTRIBUTES) { ShowError(L"File not found:\n" + g_video); return 1; }
 
-    // Task Manager Startup Registration
     {
         wchar_t exe[MAX_PATH * 4] = {};
         GetModuleFileNameW(nullptr, exe, MAX_PATH * 4);
-        std::wstring cmd = L"\"" + std::wstring(exe) + L"\" \"" + g_video + L"\"";
+        std::wstring cmd = L"\"" + std::wstring(exe) + L"\"";
+        if (opt.sound)      cmd += L" --sound";
+        if (opt.stretch)    cmd += L" --stretch";
+        if (opt.alwaysPlay) cmd += L" --always-play";
+        if (opt.lead != kDefaultLead) cmd += L" --lead " + std::to_wstring(opt.lead);
+        cmd += L" \"" + g_video + L"\"";
 
         const bool firstRun = !RegValueExists(kAppKey, L"Configured");
         if (opt.autostart || firstRun) {
             if (SetAutostart(cmd)) MarkEnabledInTaskManager();
             MarkConfigured();
-        } else if (RegValueExists(kRunKey, kRunName)) {
-            SetAutostart(cmd);
-        }
+        } else if (RegValueExists(kRunKey, kRunName)) SetAutostart(cmd);
     }
 
     g_layer = GetDesktopLayer();
-    if (!g_layer) {
-        ShowError(L"Could not find the desktop layer.");
-        return 1;
-    }
+    if (!g_layer) { ShowError(L"Could not find the desktop layer."); return 1; }
+    StopRunningInstance(g_layer);          
 
-    StopRunningInstance(g_layer); // Replace existing instance
+    if (FAILED(CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED))) return 1;
 
     WNDCLASSEXW wc = {};
     wc.cbSize        = sizeof(wc);
     wc.hInstance     = inst;
     wc.hCursor       = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = static_cast<HBRUSH>(GetStockObject(BLACK_BRUSH));
+
+    wc.lpfnWndProc   = CtrlProc;
+    wc.lpszClassName = kClass;
+    RegisterClassExW(&wc);
+
     wc.lpfnWndProc   = VideoProc;
     wc.lpszClassName = kVideoClass;
     RegisterClassExW(&wc);
 
     g_monitor = MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
 
-    g_hwnd = CreateWindowExW(0, kVideoClass, L"", WS_CHILD | WS_VISIBLE,
-                             0, 0, 100, 100, g_layer, nullptr, inst, nullptr);
-    PlaceWindow(g_hwnd);
+    g_ctrl = CreateWindowExW(0, kClass, L"LiteWall", WS_CHILD, 0, 0, 1, 1, g_layer, nullptr, inst, nullptr);
+    if (!g_ctrl) return 1;
 
-    g_mpv = mpv_create();
-    if (!g_mpv) return 1;
+    if (!MakeSlot(true, nullptr, &g_active)) { DestroyWindow(g_ctrl); return 1; }
 
-    int64_t wid = reinterpret_cast<int64_t>(g_hwnd);
-    mpv_set_property(g_mpv, "wid", MPV_FORMAT_INT64, &wid);
-
-    mpv_set_option_string(g_mpv, "loop-file", "inf");
-    mpv_set_option_string(g_mpv, "hwdec", "auto");
-    mpv_set_option_string(g_mpv, "audio", "no");
-    mpv_set_option_string(g_mpv, "osc", "no");
-    mpv_set_option_string(g_mpv, "osd-level", "0");
-    mpv_set_option_string(g_mpv, "keep-open", "yes");
-
-    if (mpv_initialize(g_mpv) < 0) return 1;
-
-    char utf8Path[MAX_PATH * 4];
-    WideCharToMultiByte(CP_UTF8, 0, g_video.c_str(), -1, utf8Path, sizeof(utf8Path), nullptr, nullptr);
-
-    const char* cmd[] = {"loadfile", utf8Path, nullptr};
-    mpv_command(g_mpv, cmd);
-
-    SetTimer(g_hwnd, T_PAUSE, 2000, nullptr);
+    SetTimer(g_ctrl, T_PAUSE, 2000, nullptr);
+    SetTimer(g_ctrl, T_LOOP, 15, nullptr); // High speed timer for accurate handoff
 
     MSG m;
     while (GetMessageW(&m, nullptr, 0, 0) > 0) {
         TranslateMessage(&m);
         DispatchMessageW(&m);
     }
+    CoUninitialize();
     return 0;
 }
